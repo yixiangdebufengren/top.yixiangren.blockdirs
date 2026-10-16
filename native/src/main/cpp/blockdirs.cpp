@@ -10,6 +10,10 @@
 #include <ctime>
 #include <android/log.h>
 #include <sys/stat.h>
+#include <errno.h>
+#include <sys/statfs.h>
+#include <sys/types.h>
+#include <time.h>
 
 #include "shadowhook.h"
 
@@ -50,26 +54,39 @@ static bool should_process_volume(const std::string &volRoot) {
 }
 
 // 递归删除目录/文件（删除用 unlink/rmdir，不经过被 hook 的 mkdir）
+// [DIAG] 全程 errno 诊断日志
 static bool remove_recursive(const std::string &path) {
     struct stat st;
     if (lstat(path.c_str(), &st) != 0) {
+        int e = errno;
+        LOGE("[DIAG] remove_recursive lstat FAIL path=%s errno=%d(%s)", path.c_str(), e, strerror(e));
         return false;
     }
     if (S_ISDIR(st.st_mode)) {
         DIR *d = opendir(path.c_str());
-        if (d != nullptr) {
+        if (d == nullptr) {
+            int e = errno;
+            LOGE("[DIAG] remove_recursive opendir FAIL path=%s errno=%d(%s)", path.c_str(), e, strerror(e));
+        } else {
             struct dirent *ent;
             while ((ent = readdir(d)) != nullptr) {
                 if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
                     continue;
                 }
+                LOGE("[DIAG]  -> removing child: %s/%s", path.c_str(), ent->d_name);
                 remove_recursive(path + "/" + ent->d_name);
             }
             closedir(d);
         }
-        return rmdir(path.c_str()) == 0;
+        int rr = rmdir(path.c_str());
+        int e = errno;
+        LOGE("[DIAG] rmdir path=%s ret=%d errno=%d(%s)", path.c_str(), rr, e, strerror(e));
+        return rr == 0;
     } else {
-        return unlink(path.c_str()) == 0;
+        int ur = unlink(path.c_str());
+        int e = errno;
+        LOGE("[DIAG] unlink path=%s ret=%d errno=%d(%s)", path.c_str(), ur, e, strerror(e));
+        return ur == 0;
     }
 }
 
@@ -133,19 +150,37 @@ static void do_delete_on_volume(const std::string &volRoot) {
         std::lock_guard<std::mutex> lock(g_names_mutex);
         names = g_delete_names;
     }
+    LOGE("[DIAG] do_delete_on_volume volRoot=%s uid=%d names=%zu",
+         volRoot.c_str(), (int)getuid(), names.size());
     if (names.empty()) {
         return;
+    }
+    // 打印卷根的文件系统类型（区分 vfat / exfat / fuseblk）
+    struct statfs sfs;
+    if (statfs(volRoot.c_str(), &sfs) == 0) {
+        LOGE("[DIAG] statfs %s type=0x%lx bsize=%ld", volRoot.c_str(),
+             (unsigned long)sfs.f_type, (long)sfs.f_bsize);
+    } else {
+        int e = errno;
+        LOGE("[DIAG] statfs %s FAIL errno=%d(%s)", volRoot.c_str(), e, strerror(e));
     }
     for (size_t i = 0; i < names.size(); ++i) {
         const std::string &n = names[i];
         std::string target = volRoot + "/" + n;
         struct stat st;
-        if (lstat(target.c_str(), &st) == 0) {
+        int lr = lstat(target.c_str(), &st);
+        if (lr == 0) {
+            LOGE("[DIAG] target EXISTS %s mode=%o uid=%d gid=%d", target.c_str(),
+                 (unsigned)st.st_mode, (int)st.st_uid, (int)st.st_gid);
             if (remove_recursive(target)) {
                 LOGW("DELETED %s", target.c_str());
             } else {
                 LOGE("delete failed: %s", target.c_str());
             }
+        } else {
+            int e = errno;
+            LOGE("[DIAG] target NOT-FOUND %s lstat_ret=%d errno=%d(%s)",
+                 target.c_str(), lr, e, strerror(e));
         }
     }
 }
@@ -154,49 +189,66 @@ static void do_delete_on_volume(const std::string &volRoot) {
 static void on_volume_path_seen(const char *path) {
     std::string volRoot, firstName;
     if (!extract_vol_and_name(path, volRoot, firstName)) {
+        LOGE("[DIAG] on_volume_path_seen: not a top-level external path: %s", path ? path : "(null)");
         return;
     }
     if (!should_process_volume(volRoot)) {
+        LOGE("[DIAG] on_volume_path_seen: SKIP by dedup-window: %s", volRoot.c_str());
         return;
     }
-    LOGI("volume activity detected: %s (root=%s)", path, volRoot.c_str());
+    LOGE("[DIAG] on_volume_path_seen: volume activity %s (root=%s)", path, volRoot.c_str());
     do_delete_on_volume(volRoot);
 }
 
 // 扫描 /storage 下所有外置卷的根目录，对每个卷执行一次删除。
 // 不依赖 mkdir 是否被调用，因此即使勾选目录已存在也能删。
 static void scan_all_volumes() {
+    LOGE("[DIAG] ===== scan_all_volumes BEGIN uid=%d =====", (int)getuid());
     const char *roots[] = {"/storage", "/mnt/media_rw"};
     for (int r = 0; r < 2; ++r) {
         DIR *d = opendir(roots[r]);
         if (d == nullptr) {
+            int e = errno;
+            LOGE("[DIAG] scan opendir FAIL root=%s errno=%d(%s)", roots[r], e, strerror(e));
             continue;
         }
+        LOGE("[DIAG] scan opendir OK root=%s", roots[r]);
         struct dirent *ent;
         while ((ent = readdir(d)) != nullptr) {
             const char *name = ent->d_name;
             if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
                 continue;
             }
+            LOGE("[DIAG] scan entry: root=%s name=%s", roots[r], name);
             if (strcmp(name, "emulated") == 0 || strcmp(name, "self") == 0
                     || strcmp(name, "persist") == 0) {
+                LOGE("[DIAG] scan skip (internal): %s", name);
                 continue;
             }
             std::string volRoot = std::string(roots[r]) + "/" + name;
             struct stat st;
-            if (lstat(volRoot.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+            int lr = lstat(volRoot.c_str(), &st);
+            if (lr != 0) {
+                int e = errno;
+                LOGE("[DIAG] scan lstat FAIL %s ret=%d errno=%d(%s)", volRoot.c_str(), lr, e, strerror(e));
+                continue;
+            }
+            if (!S_ISDIR(st.st_mode)) {
+                LOGE("[DIAG] scan skip (not dir) %s mode=%o", volRoot.c_str(), (unsigned)st.st_mode);
                 continue;
             }
             // 同一个卷可能同时出现在 /storage 与 /mnt/media_rw（bind mount），
             // 用时间窗去重，避免对同一物理卷重复遍历。
             if (!should_process_volume(volRoot)) {
+                LOGE("[DIAG] scan SKIP by dedup-window: %s", volRoot.c_str());
                 continue;
             }
-            LOGI("SCAN volume: %s", volRoot.c_str());
+            LOGE("[DIAG] scan PROCESS volume: %s", volRoot.c_str());
             do_delete_on_volume(volRoot);
         }
         closedir(d);
     }
+    LOGE("[DIAG] ===== scan_all_volumes END =====");
 }
 
 // ============ Hook 后的 mkdir / mkdirat ============
@@ -208,6 +260,7 @@ static void scan_all_volumes() {
 static int my_mkdir(const char *path, mode_t mode) {
     SHADOWHOOK_STACK_SCOPE();
 
+    LOGE("[DIAG] my_mkdir called: path=%s", path ? path : "(null)");
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdir (top-level on external volume): %s", path);
         // 卷根活动 = 卷刚被挂载/初始化。顺手删除该卷已存在的勾选目录。
@@ -221,6 +274,7 @@ static int my_mkdir(const char *path, mode_t mode) {
 static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
     SHADOWHOOK_STACK_SCOPE();
 
+    LOGE("[DIAG] my_mkdirat called: dirfd=%d path=%s", dirfd, path ? path : "(null)");
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdirat (top-level on external volume): %s", path);
         on_volume_path_seen(path);
@@ -232,28 +286,37 @@ static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
 
 extern "C" JNIEXPORT void JNICALL
 Java_top_yixiangren_blockdirs_MainHook_installNativeHook(JNIEnv *env, jclass clazz) {
-    LOGI("installNativeHook: block ALL top-level dirs on external volumes");
+    LOGE("[DIAG] installNativeHook BEGIN uid=%d pid=%d", (int)getuid(), (int)getpid());
 
-    if (shadowhook_init(SHADOWHOOK_MODE_SHARED, false) != 0) {
-        LOGE("shadowhook_init failed");
+    int sh_init = shadowhook_init(SHADOWHOOK_MODE_SHARED, false);
+    if (sh_init != 0) {
+        LOGE("[DIAG] shadowhook_init FAILED ret=%d", sh_init);
         return;
     }
+    LOGE("[DIAG] shadowhook_init OK");
 
     void *mkdir_stub = shadowhook_hook_sym_name(
             "libc.so", "mkdir", (void *)my_mkdir, (void **)&orig_mkdir);
     if (mkdir_stub != nullptr) {
-        LOGI("mkdir hooked, orig=%p", (void *)orig_mkdir);
+        LOGE("[DIAG] mkdir hooked OK, stub=%p orig=%p", mkdir_stub, (void *)orig_mkdir);
     } else {
-        LOGE("mkdir hook failed");
+        LOGE("[DIAG] mkdir hook FAILED, errno=%d(%s)", errno, strerror(errno));
     }
 
     void *mkdirat_stub = shadowhook_hook_sym_name(
             "libc.so", "mkdirat", (void *)my_mkdirat, (void **)&orig_mkdirat);
     if (mkdirat_stub != nullptr) {
-        LOGI("mkdirat hooked, orig=%p", (void *)orig_mkdirat);
+        LOGE("[DIAG] mkdirat hooked OK, stub=%p orig=%p", mkdirat_stub, (void *)orig_mkdirat);
     } else {
-        LOGE("mkdirat hook failed");
+        LOGE("[DIAG] mkdirat hook FAILED, errno=%d(%s)", errno, strerror(errno));
     }
+
+    // [DIAG] 自检：hook 建立后，主动调一次 mkdir 到 /storage 下（应被拦）。
+    // 这能直接证明代理函数是否真的被调用（不依赖外部触发）。
+    int self_r = mkdir("/storage/__BD_SELFTEST__", 0777);
+    int self_e = errno;
+    LOGE("[DIAG] selftest mkdir('/storage/__BD_SELFTEST__') ret=%d errno=%d(%s) "
+         "(ret==0 且目录不存在 => hook 生效)", self_r, self_e, strerror(self_e));
 }
 
 // ============ 供 Java 层调用的接口 ============
@@ -282,7 +345,10 @@ Java_top_yixiangren_blockdirs_MainHook_nativeSetDeleteNames(JNIEnv *env, jclass 
         std::lock_guard<std::mutex> lock(g_names_mutex);
         g_delete_names = tmp;
     }
-    LOGI("nativeSetDeleteNames: %zu names", tmp.size());
+    LOGE("[DIAG] nativeSetDeleteNames: count=%zu uid=%d", tmp.size(), (int)getuid());
+    for (size_t i = 0; i < tmp.size(); ++i) {
+        LOGE("[DIAG]   name[%zu]=%s", i, tmp[i].c_str());
+    }
 
     // 名单一旦更新（且非空）就立即主动扫描一次所有外置卷，
     // 不依赖后续是否发生 mkdir，解决“目标目录已存在导致不触发”的问题。
