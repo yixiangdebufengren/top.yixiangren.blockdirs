@@ -1,6 +1,5 @@
 package top.yixiangren.blockdirs;
 
-import android.content.SharedPreferences;
 import android.os.storage.StorageVolume;
 
 import java.util.ArrayList;
@@ -10,7 +9,6 @@ import java.util.Map;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.IXposedHookZygoteInit;
-import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
@@ -71,13 +69,12 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
         // 从模块自身配置文件读取用户勾选，推送给 native
         pushDeleteNames();
 
-        // 【主动删除通道】native 加载后立即对所有已挂载外置卷执行一次删除，
-        // 不依赖任何 mkdir 事件。这是「勾选 = 直接删掉」的核心保障。
+        // 【主动删除通道】native 加载后立即对所有已挂载外置卷执行一次删除。
+        // 注意：provider 刚启动时卷常常还没挂载就绪，这一次可能扫不到；
+        // 真正可靠的触发在 native 侧 —— 卷就绪后系统必然会对卷根 mkdir，
+        // 被 hook 命中时唤醒 native 后台线程执行删除（不依赖任何 Context）。
+        // 这里仍保留一次主动扫描，覆盖「卷已就绪、且启动即有目录」的场景。
         deleteOnAllVolumes();
-
-        // 额外 hook 卷挂载检测点 + 注册存储卷监听，插卡瞬间触发删除
-        hookVolumeMount(lpparam.classLoader);
-        registerVolumeListener();
     }
 
     /**
@@ -189,75 +186,6 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
         }
     }
 
-    private static final String TAG_LISTENER = "BlockDirsVolume";
-
-    /**
-     * 注册 StorageManager 卷状态监听：U 盘/SD 卡插入并挂载后立即触发删除。
-     * 这比盲 hook 各种不确定的方法名可靠得多（不同 ROM 方法名千差万别）。
-     */
-    private static void registerVolumeListener() {
-        try {
-            Class<?> ctxClass = Class.forName("android.app.ActivityThread");
-            Object app = XposedHelpers.callStaticMethod(ctxClass, "currentApplication");
-            if (app == null) {
-                XposedBridge.log("[" + TAG_LISTENER + "] no application context, skip listener");
-                return;
-            }
-            Object sm = XposedHelpers.callMethod(app, "getSystemService", "storage");
-            if (sm == null) {
-                return;
-            }
-            // 构造 StorageVolumeCallback
-            Class<?> cbClass = XposedHelpers.findClassIfExists(
-                    "android.os.storage.StorageManager$StorageVolumeCallback",
-                    sm.getClass().getClassLoader());
-            if (cbClass == null) {
-                XposedBridge.log("[" + TAG_LISTENER + "] StorageVolumeCallback not found, skip");
-                return;
-            }
-            Object callback = XposedHelpers.newInstance(cbClass);
-            XposedHelpers.findAndHookMethod(cbClass, "onVolumeStateChanged",
-                    new Object[]{android.os.storage.StorageVolume.class,
-                            new XC_MethodHook() {
-                                @Override
-                                protected void afterHookedMethod(MethodHookParam param) {
-                                    try {
-                                        Object vol = param.args[0];
-                                        if (vol == null) {
-                                            return;
-                                        }
-                                        Object dir = null;
-                                        try {
-                                            dir = XposedHelpers.callMethod(vol, "getDirectory");
-                                        } catch (Throwable ignored) {
-                                        }
-                                        if (dir == null) {
-                                            try {
-                                                dir = XposedHelpers.callMethod(vol, "getPath");
-                                            } catch (Throwable ignored) {
-                                            }
-                                        }
-                                        if (dir != null) {
-                                            String root = toVolumeRoot(dir.toString());
-                                            if (root != null) {
-                                                XposedBridge.log("[" + TAG_LISTENER
-                                                        + "] volume state changed -> " + root);
-                                                pushDeleteNames();  // 先刷新最新勾选
-                                                nativeDeleteOnVolume(root);
-                                            }
-                                        }
-                                    } catch (Throwable t) {
-                                        XposedBridge.log("[" + TAG_LISTENER + "] cb error: " + t);
-                                    }
-                                }
-                            }});
-            XposedHelpers.callMethod(sm, "registerListener", callback);
-            XposedBridge.log("[" + TAG_LISTENER + "] StorageManager volume listener registered");
-        } catch (Throwable t) {
-            XposedBridge.log("[" + TAG_LISTENER + "] registerVolumeListener failed: " + t);
-        }
-    }
-
     /**
      * 激活检测：LSPosed 传统模式会无条件把模块加载到自身进程（无需写进 xposed_scope）。
      * 这里 hook 自己的 {@link ModuleActive#isActive()} 使其返回 true，UI 据此显示"已激活"；
@@ -362,91 +290,6 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     public static void refreshConfig() {
         if (nativeLoaded) {
             pushDeleteNames();
-        }
-    }
-
-    /**
-     * hook 卷挂载相关的 Java 方法，作为「插入 U 盘」的检测点。
-     * 不同 Android 版本方法名不同，逐个尝试，hook 到哪个算哪个；
-     * 命中后取该卷的路径，调用 nativeDeleteOnVolume 触发删除。
-     */
-    private static void hookVolumeMount(ClassLoader cl) {
-        // 候选方法：MediaProvider / StorageManagerService 中与卷 attach 相关的方法
-        String[] methodNames = new String[]{
-                "onVolumeMount",
-                "attachVolume",
-                "onScanVolume",
-                "onVolumeCreated",
-                "mountVolume",
-                "onVolumeStateChanged",
-                "updateVolumesForCache",
-        };
-        String[] classNames = new String[]{
-                "com.android.providers.media.MediaProvider",
-                "com.android.providers.media.attachedvolume.AttachedVolume",
-                "com.android.providers.media.attachedvolume.VolumeCache",
-        };
-
-        for (String cn : classNames) {
-            Class<?> clazz = null;
-            try {
-                clazz = XposedHelpers.findClassIfExists(cn, cl);
-            } catch (Throwable ignored) {
-            }
-            if (clazz == null) continue;
-
-            for (String mn : methodNames) {
-                try {
-                    XposedHelpers.findAndHookMethod(clazz, mn, new Object[]{
-                            new XC_MethodHook() {
-                                @Override
-                                protected void afterHookedMethod(MethodHookParam param) {
-                                    try {
-                                        handleVolumeHook(param);
-                                    } catch (Throwable t) {
-                                        XposedBridge.log("[" + TAG + "] handleVolumeHook error: " + t);
-                                    }
-                                }
-                            }
-                    });
-                    XposedBridge.log("[" + TAG + "] hooked " + cn + "#" + mn);
-                } catch (Throwable ignored) {
-                    // 方法不存在或签名不匹配，跳过
-                }
-            }
-        }
-    }
-
-    /** 从 hook 到的卷挂载方法参数里尽力提取存储路径，交给 native 删除。 */
-    private static void handleVolumeHook(XC_MethodHook.MethodHookParam param) {
-        // 重新拉取一次配置（用户可能刚改了开关）
-        pushDeleteNames();
-
-        Object[] args = param.args;
-        if (args == null) return;
-        for (Object arg : args) {
-            if (arg instanceof String) {
-                String s = (String) arg;
-                if (s.startsWith("/storage/") || s.startsWith("/mnt/media_rw/")
-                        || s.startsWith("/mnt/secure/")) {
-                    String root = toVolumeRoot(s);
-                    if (root != null) {
-                        nativeDeleteOnVolume(root);
-                    }
-                }
-            } else if (arg instanceof StorageVolume) {
-                // StorageVolume 在部分版本有 getPath / getDirectory
-                try {
-                    Object path = XposedHelpers.callMethod(arg, "getPath");
-                    if (path instanceof String) {
-                        String root = toVolumeRoot((String) path);
-                        if (root != null) {
-                            nativeDeleteOnVolume(root);
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
         }
     }
 

@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <mutex>
+#include <condition_variable>
+#include <thread>
 #include <ctime>
 #include <android/log.h>
 #include <sys/stat.h>
@@ -51,6 +53,68 @@ static bool should_process_volume(const std::string &volRoot) {
     }
     g_recent_vols.push_back(std::make_pair(volRoot, now));
     return true;
+}
+
+// ============ 后台删除线程 ============
+//
+// 为什么需要它：
+//   删除的触发点必须落在「卷已挂载就绪」之后的低频事件上。
+//   实测发现两条原触发通道都不可靠：
+//     1) Java 层 StorageManager.registerListener 需要 Application Context，
+//        而 MediaProvider 进程里 ActivityThread.currentApplication() 返回 null，
+//        监听器根本没注册成功（LSPosed 日志明确报 "no application context"）。
+//     2) nativeSetDeleteNames 里立即扫一次，但 provider 刚启动时卷常常还没
+//        挂载就绪，collect_volume_roots 拿到的卷根 lstat 失败被跳过，
+//        此后没有任何后续触发。
+//   而在「卷挂载后就绪」那一刻，系统几乎必然会对卷根执行 mkdir（重建媒体
+//   目录），native 的 my_mkdir 命中一次即证明「卷此刻可用」。
+//   因此：my_mkdir 命中时只置一个「待处理卷」标记并唤醒本线程（热路径近乎
+//   零开销：一次加锁 + 一次赋值 + signal），实际扫描/递归删除全部放到本
+//   后台线程里做，既避开热路径开销，又天然由真实卷活动驱动（无需任何轮询）。
+static std::mutex g_pending_mutex;
+static std::condition_variable g_pending_cv;
+static std::string g_pending_vol;      // 待处理的卷根（空=无）
+
+// 前置声明
+static void scan_all_volumes();
+
+// 唤醒后台删除线程：由 mkdir 命中 / 名单更新等低频事件调用。
+// 极轻量，可在热路径安全调用。
+static void notify_volume_activity(const std::string &volRoot) {
+    {
+        std::lock_guard<std::mutex> lock(g_pending_mutex);
+        g_pending_vol = volRoot;
+    }
+    g_pending_cv.notify_one();
+}
+
+// 后台线程主循环：等待唤醒 -> 扫描全部外置卷并删除勾选目录。
+static void delete_worker_loop() {
+    for (;;) {
+        bool has_work = false;
+        {
+            std::unique_lock<std::mutex> lock(g_pending_mutex);
+            g_pending_cv.wait(lock, [] { return !g_pending_vol.empty(); });
+            g_pending_vol.clear();
+            has_work = true;
+        }
+        if (has_work) {
+            // 稍等一下，避开「卷刚出现、根目录权限/挂载尚未完全就绪」的瞬间；
+            // 也给系统重建目录的动作留出时间，让一次性扫描能覆盖到。
+            usleep(300 * 1000);
+            scan_all_volumes();
+        }
+    }
+}
+
+// 懒启动后台线程（只起一个，进程内单例）。
+static void ensure_delete_worker() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread t(delete_worker_loop);
+        t.detach();
+        LOGI("delete worker thread started uid=%d pid=%d", (int)getuid(), (int)getpid());
+    });
 }
 
 // 删除一个目录，失败于 ENOTEMPTY/EBUSY 时重试若干次（每次间隔递增）。
@@ -188,9 +252,6 @@ static bool is_top_level_on_external(const char *path) {
     return extract_vol_and_name(path, volRoot, firstName);
 }
 
-// 前置声明：扫描全部外置卷并删除
-static void scan_all_volumes();
-
 // 对某个卷根执行「删除用户勾选的目录」
 static void do_delete_on_volume(const std::string &volRoot) {
     std::vector<std::string> names;
@@ -311,6 +372,14 @@ static int my_mkdir(const char *path, mode_t mode) {
 
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdir (top-level on external volume): %s", path);
+        // 命中即证明「该外置卷此刻已挂载就绪」（系统正在往上写目录）。
+        // 这里只做一次超轻量的标记 + 唤醒后台删除线程，绝不在热路径上做
+        // 扫描/递归/删除。真正的删除由后台线程执行。
+        std::string volRoot, firstName;
+        if (extract_vol_and_name(path, volRoot, firstName)) {
+            ensure_delete_worker();
+            notify_volume_activity(volRoot);
+        }
         return 0;  // 假装成功，但不真正创建
     }
     return SHADOWHOOK_CALL_PREV(my_mkdir, path, mode);
@@ -321,6 +390,11 @@ static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
 
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdirat (top-level on external volume): %s", path);
+        std::string volRoot, firstName;
+        if (extract_vol_and_name(path, volRoot, firstName)) {
+            ensure_delete_worker();
+            notify_volume_activity(volRoot);
+        }
         return 0;
     }
     return SHADOWHOOK_CALL_PREV(my_mkdirat, dirfd, path, mode);
@@ -349,6 +423,9 @@ Java_top_yixiangren_blockdirs_MainHook_installNativeHook(JNIEnv *env, jclass cla
     }
 
     LOGI("hook installed: mkdir=%p mkdirat=%p", mkdir_stub, mkdirat_stub);
+
+    // 确保后台删除线程已启动（幂等）。即使此时名单尚空，线程也只是等待。
+    ensure_delete_worker();
 }
 
 // ============ 供 Java 层调用的接口 ============
@@ -379,10 +456,13 @@ Java_top_yixiangren_blockdirs_MainHook_nativeSetDeleteNames(JNIEnv *env, jclass 
     }
     LOGI("setDeleteNames count=%zu uid=%d", tmp.size(), (int)getuid());
 
-    // 名单一旦更新（且非空）就立即主动扫描一次所有外置卷，
-    // 不依赖后续是否发生 mkdir，解决“目标目录已存在导致不触发”的问题。
+    // 名单一旦更新（且非空），启动后台删除线程并立即唤醒一次，
+    // 尝试对当前已就绪的卷删除。注意：provider 刚启动时卷可能尚未挂载
+    // 就绪，此时这次扫描可能空跑 —— 没关系，后续任一 mkdir 命中（卷真正
+    // 就绪的信号）都会再次唤醒本线程，保证最终一定删到。
     if (!tmp.empty()) {
-        scan_all_volumes();
+        ensure_delete_worker();
+        notify_volume_activity("__all__");  // 空标记表示「先全量扫一次」
     }
 }
 
