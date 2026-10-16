@@ -22,10 +22,6 @@
     <string name="setting_hide_icon_title">隐藏桌面图标</string>
     <string name="setting_hide_icon_subtitle">隐藏后仍可从 LSPosed 的「打开模块」进入</string>
 
-    <!-- 自动删除文件夹 -->
-    <string name="setting_auto_delete_title">自动删除已存在文件夹</string>
-    <string name="setting_auto_delete_subtitle">插入 U 盘/SD 卡时，删除已存在的勾选目录（含内容）【需要 Root 权限】</string>
-
     <!-- 链接分组标题 -->
     <string name="link_section_title">链接</string>
 

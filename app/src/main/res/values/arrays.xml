@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- LSPosed 默认推荐的作用域：勾选模块时自动预选这些应用。
-         只需 com.android.providers.media.module（实测 UID 10192，真正干活的进程）。
-         旧式 com.android.providers.media（android.process.media / UID 10079）是空壳：
-         实测其从未被注入，勾选也无效，已移除。 -->
+         只保留 com.android.providers.media.module（实测 UID 10192，真正干活的进程）。
+         旧式 com.android.providers.media（android.process.media / UID 10079）实测从未被注入，
+         是空壳，勾选也无效，已移除。 -->
     <string-array name="xposed_scope">
         <item>com.android.providers.media.module</item>
     </string-array>

@@ -8,7 +8,6 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
-import android.view.LayoutInflater;
 import android.view.View;
 import android.view.Window;
 import android.widget.ImageView;
@@ -25,13 +24,8 @@ import com.google.android.material.snackbar.Snackbar;
  *
  * 浅绿主题 + Material 卡片布局 + 居中标题栏。
  * 顶部卡片点击跳转到博客说明页。
- *
- * 新增：设置区加入「自动删除已存在文件夹」主开关，开启后动态展开
- * 各目录的子开关（由 {@link DirConfig#DIRS} 生成）。
  */
 public class MainActivity extends Activity {
-
-    private LinearLayout dirListContainer;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -46,7 +40,6 @@ public class MainActivity extends Activity {
         bindHideIconSwitch();
         bindActivationStatus();
         bindUpdateCheck();
-        bindAutoDeleteSwitch();
         checkUpdate();
     }
 
@@ -56,8 +49,11 @@ public class MainActivity extends Activity {
      */
     private void applyStatusBar() {
         Window window = getWindow();
+        // 取动态取色后的 surface 色作为状态栏背景（与页面背景一致）
+        // colorSurface 是 Material Components 定义的 attr，不是框架 android.R.attr
         int surface = resolveThemeColor(com.google.android.material.R.attr.colorSurface);
         window.setStatusBarColor(surface);
+        // 浅色背景 -> 深色前景图标，深色背景 -> 浅色前景图标
         boolean isLight = ColorUtils.calculateLuminance(surface) > 0.5;
         int flags = window.getDecorView().getSystemUiVisibility();
         if (isLight) {
@@ -77,134 +73,10 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 绑定「自动删除已存在文件夹」主开关。
-     * 开启后展开目录子开关列表；关闭则收起。
-     */
-    private void bindAutoDeleteSwitch() {
-        dirListContainer = findViewById(R.id.dir_list_container);
-        MaterialSwitch master = findViewById(R.id.switch_auto_delete);
-        if (master == null || dirListContainer == null) return;
-
-        boolean enabled = DirConfig.isAutoDeleteEnabled(this);
-        master.setChecked(enabled);
-        renderDirList(enabled);
-
-        master.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            DirConfig.setAutoDeleteEnabled(this, isChecked);
-            renderDirList(isChecked);
-            notifyConfigChanged();
-        });
-    }
-
-    /** 根据 DirConfig.DIRS 动态生成目录子开关列表。 */
-    private void renderDirList(boolean visible) {
-        if (dirListContainer == null) return;
-        dirListContainer.removeAllViews();
-        dirListContainer.setVisibility(visible ? View.VISIBLE : View.GONE);
-        if (!visible) return;
-
-        LayoutInflater inflater = LayoutInflater.from(this);
-        int marginTop = (int) (getResources().getDisplayMetrics().density * 10);
-        for (DirConfig.Dir d : DirConfig.DIRS) {
-            View row = inflater.inflate(R.layout.item_dir_switch, dirListContainer, false);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT);
-            lp.topMargin = marginTop;
-            row.setLayoutParams(lp);
-
-            TextView label = row.findViewById(R.id.dir_label);
-            label.setText(d.name);
-
-            MaterialSwitch sw = row.findViewById(R.id.dir_switch);
-            sw.setChecked(DirConfig.isDirEnabled(this, d.name));
-            sw.setOnCheckedChangeListener((buttonView, isChecked) -> {
-                DirConfig.setDirEnabled(this, d.name, isChecked);
-                notifyConfigChanged();
-            });
-
-            dirListContainer.addView(row);
-        }
-    }
-
-    /**
-     * 配置变更后：
-     *  1) 用 root 把镜像文件写进 MediaProvider 私有目录；
-     *  2) 杀掉 MediaProvider 进程，让它重启时重新读取新配置。
-     * 两者都在后台线程执行，不阻塞 UI。
-     */
-    private void notifyConfigChanged() {
-        final String content = DirConfig.buildMirrorContent(this);
-        new Thread(() -> writeConfAsRoot(content)).start();
-    }
-
-    /**
-     * 用 su 把配置写到 MediaProvider 私有目录（0600，属主=provider uid，
-     * 标签=privapp_data_file），然后杀掉 MediaProvider 进程，使其重启时重读配置。
-     *
-     * 为什么要杀：native 里的名单 g_delete_names 只在进程启动（handleLoadPackage
-     * -> pushDeleteNames）时写入一次；不重启进程，改了配置也不会重新推送。
-     * MediaProvider 被杀后系统会自动拉起，属于安全操作。
-     */
-    private void writeConfAsRoot(String content) {
-        Process p = null;
-        try {
-            // 先写一个临时文件（App 有权限），再让 su 复制到目标位置
-            java.io.File tmp = new java.io.File(getCacheDir(), "blockdirs.conf");
-            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp)) {
-                fos.write(content.getBytes("UTF-8"));
-            }
-            // 目标：MediaProvider 自己的私有目录。因为 /data/local/tmp 的 SELinux
-            // 标签是 shell_data_file，provider 的 mediaprovider_app 域读它会被拒；
-            // 写进 provider 自己家目录（privapp_data_file）则天然放行。
-            // 关键：写完必须改对「权限 + 属主 + SELinux 标签」，否则 provider 仍读不到。
-            String dir = "/data/user_de/0/com.android.providers.media.module";
-            String target = dir + "/blockdirs.conf";
-            // 动态查询 provider 目录的属主，避免硬编码 uid 在其他设备/重装后失效；
-            // 若目录不存在（stat 失败）则退回按包名解析 uid 的方式。
-            String cmd = "TARGET=" + target
-                    + "; if [ -d " + dir + " ]; then"
-                    + " UID=$(stat -c %u " + dir + "); GID=$(stat -c %g " + dir + ");"
-                    + " else UID=$(stat -c %u /data/data/com.android.providers.media.module);"
-                    + " GID=$(stat -c %g /data/data/com.android.providers.media.module); fi;"
-                    + " cp -f " + tmp.getAbsolutePath() + " $TARGET"
-                    + " && chmod 600 $TARGET"
-                    + " && chown $UID:$GID $TARGET"
-                    + " && chcon u:object_r:privapp_data_file:s0 $TARGET";
-            p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
-            int code = p.waitFor();
-            android.util.Log.i("BlockDirs", "writeConfAsRoot exit=" + code);
-
-            // 配置写入成功后重启 MediaProvider，让它重新推送名单
-            if (code == 0) {
-                restartMediaProvider();
-            }
-        } catch (Throwable t) {
-            android.util.Log.w("BlockDirs", "writeConfAsRoot failed: " + t);
-        } finally {
-            if (p != null) p.destroy();
-        }
-    }
-
-    /**
-     * 杀掉 MediaProvider 进程，让系统重新拉起并读取新配置。
-     * 只杀进程不杀 App，系统会在下次访问媒体时自动重启该服务。
-     */
-    private void restartMediaProvider() {
-        try {
-            String pkg = "com.android.providers.media.module";
-            // am force-stop 会彻底停掉并阻止自动重启一段时间，不适合；
-            // 这里用 kill 直接杀进程，系统检测到 binder 死亡后会自动重建。
-            Runtime.getRuntime().exec(new String[]{"su", "-c", "killall -9 " + pkg})
-                    .waitFor();
-            android.util.Log.i("BlockDirs", "restartMediaProvider: killed " + pkg);
-        } catch (Throwable t) {
-            android.util.Log.w("BlockDirs", "restartMediaProvider failed: " + t);
-        }
-    }
-
-    /**
      * 绑定「模块激活状态」卡片。
+     * 检测 LSPosed 框架是否已注入 zygote（传统模式免 root）：
+     * 若系统 classloader 能加载 XposedBridge，说明框架已激活，
+     * 模块 UI 既已能启动，即为已激活状态。
      */
     private void bindActivationStatus() {
         LinearLayout card = findViewById(R.id.card_status);
@@ -227,6 +99,13 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * 判断模块是否激活。
+     *
+     * 默认返回 false；模块在 handleLoadPackage 检测到自身包名被加载时，
+     * 会 hook {@link ModuleActive#isActive()} 使其返回 true。关闭模块后
+     * 该 hook 不再注入，自然回到 false，无任何持久化残留。
+     */
     private boolean isModuleActive() {
         return ModuleActive.isActive();
     }

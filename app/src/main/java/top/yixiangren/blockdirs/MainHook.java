@@ -1,12 +1,5 @@
 package top.yixiangren.blockdirs;
 
-import android.os.storage.StorageVolume;
-
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodReplacement;
@@ -15,32 +8,22 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 /**
- * 阻止 MediaProvider 在 OTG/SD 卡等外置存储卷的根目录下创建任何目录，
- * 并可选地「自动删除」外置卷根目录下已存在的、用户勾选的目录。
+ * 阻止 MediaProvider 在 OTG/SD 卡等外置存储卷的根目录下创建任何目录。
  *
  * 实测结论（ColorOS 16 / Android 16）：
  *  目录创建者是 com.android.providers.media.module（uid 10176），
  *  创建发生在 native 层（libfuse 的 fuse_fs_mkdir -> libc 的 mkdir/mkdirat），
  *  Java 层 File.mkdir 不会被调用。
  *
- * 方案：
- *  1) Hook 目标进程内 libc 的 mkdir/mkdirat：只要路径是「外置卷根目录下
- *     的第一层目录」，一律返回成功但不创建（阻止创建，默认行为）。
- *  2) 若用户开启了「自动删除」并勾选了目录，则把这些目录名传入 native，
- *     由被注入的 MediaProvider 进程在检测到卷活动时递归删除这些目录
- *     （只删第一层，递归删内容）。
- *
- * 删除触发有两条通道：
- *  A. native 层：mkdir 被拦截时（说明卷刚被写入/初始化），触发一次删除；
- *  B. Java 层：hook 存储卷挂载相关方法，主动调用 nativeDeleteOnVolume。
- *  两条通道由 native 侧 30 秒时间窗去重，不会重复删。
+ * 方案：Hook 目标进程内 libc 的 mkdir/mkdirat，
+ * 只要路径是「外置卷根目录下的第一层目录」，一律返回成功但不创建。
+ * 不依赖任何硬编码目录名，无遗漏。
  */
 public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     private static final String TAG = "BlockDirs";
     private static final String SELF_PACKAGE = "top.yixiangren.blockdirs";
     private static final String MEDIA_PROVIDER = "com.android.providers.media.module";
-
     private static volatile boolean nativeLoaded = false;
 
     @Override
@@ -65,125 +48,6 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
         }
 
         installNativeHook();
-
-        // 从模块自身配置文件读取用户勾选，推送给 native
-        pushDeleteNames();
-
-        // 【主动删除通道】native 加载后立即对所有已挂载外置卷执行一次删除。
-        // 注意：provider 刚启动时卷常常还没挂载就绪，这一次可能扫不到；
-        // 真正可靠的触发在 native 侧 —— 卷就绪后系统必然会对卷根 mkdir，
-        // 被 hook 命中时唤醒 native 后台线程执行删除（不依赖任何 Context）。
-        // 这里仍保留一次主动扫描，覆盖「卷已就绪、且启动即有目录」的场景。
-        deleteOnAllVolumes();
-    }
-
-    /**
-     * 立即对所有已挂载的外置卷执行一次删除。
-     *
-     * 卷根来源有两条，互为兜底：
-     *  1) StorageManager.getStorageVolumes()（Java 官方 API，最可靠）；
-     *  2) /proc/self/mounts 中解析 /storage/&lt;uuid&gt;（不依赖任何权限）。
-     *
-     * 之所以必须主动做，而不是等 mkdir：用户勾选的目录可能「已存在」且系统
-     * 不再重建它（例如空目录 DCIM），此时没有任何 mkdir 事件，被动触发永远不删。
-     */
-    private static void deleteOnAllVolumes() {
-        java.util.Set<String> roots = new java.util.LinkedHashSet<>();
-        collectVolumesFromStorageManager(roots);
-        collectVolumesFromProcMounts(roots);
-        if (roots.isEmpty()) {
-            XposedBridge.log("[" + TAG + "] deleteOnAllVolumes: no external volume found");
-            return;
-        }
-        for (String root : roots) {
-            XposedBridge.log("[" + TAG + "] deleteOnAllVolumes -> " + root);
-            nativeDeleteOnVolume(root);
-        }
-    }
-
-    /** 通过 StorageManager 官方 API 获取所有外置卷根目录。 */
-    private static void collectVolumesFromStorageManager(java.util.Set<String> out) {
-        try {
-            Class<?> ctxClass = Class.forName("android.app.ActivityThread");
-            Object app = XposedHelpers.callStaticMethod(ctxClass, "currentApplication");
-            if (app == null) {
-                return;
-            }
-            Object sm = XposedHelpers.callMethod(app, "getSystemService", "storage");
-            if (sm == null) {
-                return;
-            }
-            java.util.List<?> volumes =
-                    (java.util.List<?>) XposedHelpers.callMethod(sm, "getStorageVolumes");
-            if (volumes == null) {
-                return;
-            }
-            for (Object vol : volumes) {
-                // 只处理「可移除 + 已挂载」的外置卷
-                Boolean removable = null;
-                try {
-                    removable = (Boolean) XposedHelpers.callMethod(vol, "isRemovable");
-                } catch (Throwable ignored) {
-                }
-                try {
-                    Object state = XposedHelpers.callMethod(vol, "getState");
-                    if (state != null && !"mounted".equals(state.toString())) {
-                        continue;
-                    }
-                } catch (Throwable ignored) {
-                }
-                if (removable != null && !removable) {
-                    continue; // 内部卷跳过
-                }
-                Object dir = null;
-                try {
-                    dir = XposedHelpers.callMethod(vol, "getDirectory");
-                } catch (Throwable ignored) {
-                }
-                if (dir == null) {
-                    try {
-                        dir = XposedHelpers.callMethod(vol, "getPath");
-                    } catch (Throwable ignored) {
-                    }
-                }
-                if (dir != null) {
-                    String root = toVolumeRoot(dir.toString());
-                    if (root != null) {
-                        out.add(root);
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            XposedBridge.log("[" + TAG + "] collectFromStorageManager failed: " + t);
-        }
-    }
-
-    /** 从 /proc/self/mounts 解析 /storage/&lt;uuid&gt; 形式的外置卷挂载点。 */
-    private static void collectVolumesFromProcMounts(java.util.Set<String> out) {
-        java.io.BufferedReader br = null;
-        try {
-            br = new java.io.BufferedReader(new java.io.FileReader("/proc/self/mounts"));
-            String line;
-            while ((line = br.readLine()) != null) {
-                String[] parts = line.split("\\s+");
-                if (parts.length < 3) {
-                    continue;
-                }
-                String root = toVolumeRoot(parts[1]);
-                if (root != null) {
-                    out.add(root);
-                }
-            }
-        } catch (Throwable t) {
-            XposedBridge.log("[" + TAG + "] collectFromProcMounts failed: " + t);
-        } finally {
-            if (br != null) {
-                try {
-                    br.close();
-                } catch (Throwable ignored) {
-                }
-            }
-        }
     }
 
     /**
@@ -221,110 +85,5 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
         }
     }
 
-    /**
-     * 读取模块 App 写入的配置，把「已开启的目录名」推送给 native。
-     *
-     * 重要：MediaProvider 进程无法读模块 App 的私有 SharedPreferences
-     * （/data/data/top.yixiangren.blockdirs 是 0700，XSharedPreferences 会被拒），
-     * 因此首选读取模块 App 写的全局可读镜像文件 /data/local/tmp/blockdirs.conf；
-     * 只有镜像文件读不到时才回退到 XSharedPreferences。
-     * 未开启主开关时推送空数组，native 即不做删除（等于只阻止创建）。
-     */
-    private static void pushDeleteNames() {
-        try {
-            List<String> names = new ArrayList<>();
-            boolean autoDelete = false;
-
-            // 首选：读全局可读的镜像文件
-            String content = DirConfig.readMirrorFile();
-            if (content != null) {
-                Map<String, String> kv = parseConf(content);
-                autoDelete = "1".equals(kv.get(DirConfig.KEY_AUTO_DELETE));
-                if (autoDelete) {
-                    for (DirConfig.Dir d : DirConfig.DIRS) {
-                        if ("1".equals(kv.get(DirConfig.KEY_DIR_PREFIX + d.name))) {
-                            names.add(d.name);
-                        }
-                    }
-                }
-                XposedBridge.log("[" + TAG + "] pushDeleteNames(from conf): autoDelete="
-                        + autoDelete + ", count=" + names.size());
-                nativeSetDeleteNames(names.toArray(new String[0]));
-                return;
-            }
-
-            // 回退：XSharedPreferences
-            de.robv.android.xposed.XSharedPreferences prefs =
-                    new de.robv.android.xposed.XSharedPreferences(SELF_PACKAGE, DirConfig.PREFS_NAME);
-            prefs.reload();
-            autoDelete = prefs.getBoolean(DirConfig.KEY_AUTO_DELETE, false);
-            if (autoDelete) {
-                for (DirConfig.Dir d : DirConfig.DIRS) {
-                    boolean on = prefs.getBoolean(DirConfig.KEY_DIR_PREFIX + d.name, d.defaultOn);
-                    if (on) {
-                        names.add(d.name);
-                    }
-                }
-            }
-            nativeSetDeleteNames(names.toArray(new String[0]));
-            XposedBridge.log("[" + TAG + "] pushDeleteNames(from xprefs): autoDelete="
-                    + autoDelete + ", count=" + names.size());
-        } catch (Throwable t) {
-            XposedBridge.log("[" + TAG + "] pushDeleteNames failed: " + t);
-        }
-    }
-
-    /** 解析 key=value 格式的配置文件。 */
-    private static Map<String, String> parseConf(String content) {
-        Map<String, String> map = new HashMap<>();
-        for (String line : content.split("\n")) {
-            int eq = line.indexOf('=');
-            if (eq > 0) {
-                map.put(line.substring(0, eq).trim(), line.substring(eq + 1).trim());
-            }
-        }
-        return map;
-    }
-
-    /** 供外部主动刷新配置（例如某些 ROM 设置变更后）。 */
-    public static void refreshConfig() {
-        if (nativeLoaded) {
-            pushDeleteNames();
-        }
-    }
-
-    /**
-     * 把任意「卷内路径」裁剪成卷根（/storage/XXXX-XXXX 或 /mnt/media_rw/XXXX-XXXX），
-     * 若不是外置卷则返回 null。
-     */
-    private static String toVolumeRoot(String path) {
-        String base;
-        String prefix;
-        if (path.startsWith("/storage/")) {
-            prefix = "/storage/";
-            base = path.substring("/storage/".length());
-        } else if (path.startsWith("/mnt/media_rw/")) {
-            prefix = "/mnt/media_rw/";
-            base = path.substring("/mnt/media_rw/".length());
-        } else if (path.startsWith("/mnt/secure/")) {
-            prefix = "/mnt/secure/";
-            base = path.substring("/mnt/secure/".length());
-        } else {
-            return null;
-        }
-        // 排除内部共享存储
-        if (base.startsWith("emulated")) {
-            return null;
-        }
-        int slash = base.indexOf('/');
-        String uuid = slash < 0 ? base : base.substring(0, slash);
-        if (uuid.isEmpty()) return null;
-        return prefix + uuid;
-    }
-
     private static native void installNativeHook();
-
-    private static native void nativeSetDeleteNames(String[] names);
-
-    private static native void nativeDeleteOnVolume(String volumeRoot);
 }
