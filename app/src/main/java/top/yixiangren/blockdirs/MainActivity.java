@@ -128,12 +128,65 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 配置变更后尝试通知 MediaProvider 进程立即刷新（进程若未运行则忽略，
-     * 下次被 LSPosed 注入时会重新读取）。
+     * 配置变更后：
+     *  1) 尽尝试用 root 写全局可读的镜像文件 /data/local/tmp/blockdirs.conf；
+     *  2) 杀掉 MediaProvider 进程，让它重启时重新读取新配置。
+     * 两者都在后台线程执行，不阻塞 UI。
      */
     private void notifyConfigChanged() {
-        // MediaProvider 进程在下次卷活动时会重新读取 XSharedPreferences，
-        // 这里无需强制重启进程，保持简单可靠。
+        final String content = DirConfig.buildMirrorContent(this);
+        new Thread(() -> writeConfAsRoot(content)).start();
+    }
+
+    /**
+     * 用 su 把配置写到 /data/local/tmp/blockdirs.conf（0644，全局可读），
+     * 然后杀掉 MediaProvider 进程，使其重启时重新读取新配置。
+     *
+     * 为什么要杀：native 里的名单 g_delete_names 只在进程启动（handleLoadPackage
+     * -> pushDeleteNames）时写入一次；不重启进程，改了配置也不会重新推送。
+     * MediaProvider 被杀后系统会自动拉起，属于安全操作。
+     */
+    private void writeConfAsRoot(String content) {
+        Process p = null;
+        try {
+            // 先写一个临时文件（App 有权限），再让 su 复制到目标位置
+            java.io.File tmp = new java.io.File(getCacheDir(), "blockdirs.conf");
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp)) {
+                fos.write(content.getBytes("UTF-8"));
+            }
+            String cmd = "cp " + tmp.getAbsolutePath() + " " + DirConfig.CONFIG_FILE
+                    + " && chmod 644 " + DirConfig.CONFIG_FILE
+                    + " && chown root:root " + DirConfig.CONFIG_FILE;
+            p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+            int code = p.waitFor();
+            android.util.Log.i("BlockDirs", "writeConfAsRoot exit=" + code);
+
+            // 配置写入成功后重启 MediaProvider，让它重新推送名单
+            if (code == 0) {
+                restartMediaProvider();
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("BlockDirs", "writeConfAsRoot failed: " + t);
+        } finally {
+            if (p != null) p.destroy();
+        }
+    }
+
+    /**
+     * 杀掉 MediaProvider 进程，让系统重新拉起并读取新配置。
+     * 只杀进程不杀 App，系统会在下次访问媒体时自动重启该服务。
+     */
+    private void restartMediaProvider() {
+        try {
+            String pkg = "com.android.providers.media.module";
+            // am force-stop 会彻底停掉并阻止自动重启一段时间，不适合；
+            // 这里用 kill 直接杀进程，系统检测到 binder 死亡后会自动重建。
+            Runtime.getRuntime().exec(new String[]{"su", "-c", "killall -9 " + pkg})
+                    .waitFor();
+            android.util.Log.i("BlockDirs", "restartMediaProvider: killed " + pkg);
+        } catch (Throwable t) {
+            android.util.Log.w("BlockDirs", "restartMediaProvider failed: " + t);
+        }
     }
 
     /**

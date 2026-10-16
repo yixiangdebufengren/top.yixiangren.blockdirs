@@ -30,13 +30,13 @@ static std::mutex g_names_mutex;
 static std::vector<std::pair<std::string, time_t> > g_recent_vols;
 static std::mutex g_recent_mutex;
 
-// 同一卷根在 30 秒内只处理一次，防止 mkdir 高频调用导致重复删除
+// 同一卷根在 10 秒内只处理一次，防止 mkdir 高频调用导致重复删除
 static bool should_process_volume(const std::string &volRoot) {
     std::lock_guard<std::mutex> lock(g_recent_mutex);
     time_t now = time(nullptr);
     for (std::vector<std::pair<std::string, time_t> >::iterator it = g_recent_vols.begin();
          it != g_recent_vols.end(); ) {
-        if (now - it->second > 30) {
+        if (now - it->second > 10) {
             it = g_recent_vols.erase(it);
         } else {
             if (it->first == volRoot) {
@@ -123,6 +123,9 @@ static bool is_top_level_on_external(const char *path) {
     return extract_vol_and_name(path, volRoot, firstName);
 }
 
+// 前置声明：扫描全部外置卷并删除
+static void scan_all_volumes();
+
 // 对某个卷根执行「删除用户勾选的目录」
 static void do_delete_on_volume(const std::string &volRoot) {
     std::vector<std::string> names;
@@ -160,12 +163,50 @@ static void on_volume_path_seen(const char *path) {
     do_delete_on_volume(volRoot);
 }
 
+// 扫描 /storage 下所有外置卷的根目录，对每个卷执行一次删除。
+// 不依赖 mkdir 是否被调用，因此即使勾选目录已存在也能删。
+static void scan_all_volumes() {
+    const char *roots[] = {"/storage", "/mnt/media_rw"};
+    for (int r = 0; r < 2; ++r) {
+        DIR *d = opendir(roots[r]);
+        if (d == nullptr) {
+            continue;
+        }
+        struct dirent *ent;
+        while ((ent = readdir(d)) != nullptr) {
+            const char *name = ent->d_name;
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+                continue;
+            }
+            if (strcmp(name, "emulated") == 0 || strcmp(name, "self") == 0
+                    || strcmp(name, "persist") == 0) {
+                continue;
+            }
+            std::string volRoot = std::string(roots[r]) + "/" + name;
+            struct stat st;
+            if (lstat(volRoot.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+                continue;
+            }
+            // 同一个卷可能同时出现在 /storage 与 /mnt/media_rw（bind mount），
+            // 用时间窗去重，避免对同一物理卷重复遍历。
+            if (!should_process_volume(volRoot)) {
+                continue;
+            }
+            LOGI("SCAN volume: %s", volRoot.c_str());
+            do_delete_on_volume(volRoot);
+        }
+        closedir(d);
+    }
+}
+
 // ============ Hook 后的 mkdir / mkdirat ============
 static int my_mkdir(const char *path, mode_t mode) {
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdir (top-level on external volume): %s", path);
-        // 有卷根层面的活动 = 卷刚被挂载/初始化，顺带执行「删除已存在勾选目录」
+        // 有卷根层面的活动 = 卷刚被挂载/初始化，触发一次全卷扫描，
+        // 删除所有已存在的勾选目录（不局限于当前路径所在的卷）。
         on_volume_path_seen(path);
+        scan_all_volumes();
         return 0;
     }
     return orig_mkdir(path, mode);
@@ -175,6 +216,7 @@ static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdirat (top-level on external volume): %s", path);
         on_volume_path_seen(path);
+        scan_all_volumes();
         return 0;
     }
     return orig_mkdirat(dirfd, path, mode);
@@ -233,6 +275,12 @@ Java_top_yixiangren_blockdirs_MainHook_nativeSetDeleteNames(JNIEnv *env, jclass 
         g_delete_names = tmp;
     }
     LOGI("nativeSetDeleteNames: %zu names", tmp.size());
+
+    // 名单一旦更新（且非空）就立即主动扫描一次所有外置卷，
+    // 不依赖后续是否发生 mkdir，解决“目标目录已存在导致不触发”的问题。
+    if (!tmp.empty()) {
+        scan_all_volumes();
+    }
 }
 
 // 主动对某个卷根执行一次删除（供 Java 层在检测到挂载时调用）

@@ -4,7 +4,9 @@ import android.content.SharedPreferences;
 import android.os.storage.StorageVolume;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.IXposedHookZygoteInit;
@@ -110,20 +112,42 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     /**
-     * 读取模块 App 写入的配置（XSharedPreferences 跨进程读取同名 prefs），
-     * 把「已开启的目录名」推送给 native。
+     * 读取模块 App 写入的配置，把「已开启的目录名」推送给 native。
+     *
+     * 重要：MediaProvider 进程无法读模块 App 的私有 SharedPreferences
+     * （/data/data/top.yixiangren.blockdirs 是 0700，XSharedPreferences 会被拒），
+     * 因此首选读取模块 App 写的全局可读镜像文件 /data/local/tmp/blockdirs.conf；
+     * 只有镜像文件读不到时才回退到 XSharedPreferences。
      * 未开启主开关时推送空数组，native 即不做删除（等于只阻止创建）。
      */
     private static void pushDeleteNames() {
         try {
-            // 模块运行在 MediaProvider 进程里，无法直接用本进程 Context 读模块 App 的私有 prefs，
-            // 因此使用 XSharedPreferences（需在 LSPosed 中开启「世界可读」或依赖模块自身实现）。
+            List<String> names = new ArrayList<>();
+            boolean autoDelete = false;
+
+            // 首选：读全局可读的镜像文件
+            String content = DirConfig.readMirrorFile();
+            if (content != null) {
+                Map<String, String> kv = parseConf(content);
+                autoDelete = "1".equals(kv.get(DirConfig.KEY_AUTO_DELETE));
+                if (autoDelete) {
+                    for (DirConfig.Dir d : DirConfig.DIRS) {
+                        if ("1".equals(kv.get(DirConfig.KEY_DIR_PREFIX + d.name))) {
+                            names.add(d.name);
+                        }
+                    }
+                }
+                XposedBridge.log("[" + TAG + "] pushDeleteNames(from conf): autoDelete="
+                        + autoDelete + ", count=" + names.size());
+                nativeSetDeleteNames(names.toArray(new String[0]));
+                return;
+            }
+
+            // 回退：XSharedPreferences
             de.robv.android.xposed.XSharedPreferences prefs =
                     new de.robv.android.xposed.XSharedPreferences(SELF_PACKAGE, DirConfig.PREFS_NAME);
             prefs.reload();
-
-            List<String> names = new ArrayList<>();
-            boolean autoDelete = prefs.getBoolean(DirConfig.KEY_AUTO_DELETE, false);
+            autoDelete = prefs.getBoolean(DirConfig.KEY_AUTO_DELETE, false);
             if (autoDelete) {
                 for (DirConfig.Dir d : DirConfig.DIRS) {
                     boolean on = prefs.getBoolean(DirConfig.KEY_DIR_PREFIX + d.name, d.defaultOn);
@@ -133,11 +157,23 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
                 }
             }
             nativeSetDeleteNames(names.toArray(new String[0]));
-            XposedBridge.log("[" + TAG + "] pushDeleteNames: autoDelete=" + autoDelete
-                    + ", count=" + names.size());
+            XposedBridge.log("[" + TAG + "] pushDeleteNames(from xprefs): autoDelete="
+                    + autoDelete + ", count=" + names.size());
         } catch (Throwable t) {
             XposedBridge.log("[" + TAG + "] pushDeleteNames failed: " + t);
         }
+    }
+
+    /** 解析 key=value 格式的配置文件。 */
+    private static Map<String, String> parseConf(String content) {
+        Map<String, String> map = new HashMap<>();
+        for (String line : content.split("\n")) {
+            int eq = line.indexOf('=');
+            if (eq > 0) {
+                map.put(line.substring(0, eq).trim(), line.substring(eq + 1).trim());
+            }
+        }
+        return map;
     }
 
     /** 供外部主动刷新配置（例如某些 ROM 设置变更后）。 */
