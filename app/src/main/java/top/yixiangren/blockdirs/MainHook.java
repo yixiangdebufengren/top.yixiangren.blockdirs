@@ -72,8 +72,191 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
         // 从模块自身配置文件读取用户勾选，推送给 native
         pushDeleteNames();
 
-        // 额外 hook 卷挂载检测点，主动触发删除
+        // 【主动删除通道】native 加载后立即对所有已挂载外置卷执行一次删除，
+        // 不依赖任何 mkdir 事件。这是「勾选 = 直接删掉」的核心保障。
+        deleteOnAllVolumes();
+
+        // 额外 hook 卷挂载检测点 + 注册存储卷监听，插卡瞬间触发删除
         hookVolumeMount(lpparam.classLoader);
+        registerVolumeListener();
+    }
+
+    /**
+     * 立即对所有已挂载的外置卷执行一次删除。
+     *
+     * 卷根来源有两条，互为兜底：
+     *  1) StorageManager.getStorageVolumes()（Java 官方 API，最可靠）；
+     *  2) /proc/self/mounts 中解析 /storage/&lt;uuid&gt;（不依赖任何权限）。
+     *
+     * 之所以必须主动做，而不是等 mkdir：用户勾选的目录可能「已存在」且系统
+     * 不再重建它（例如空目录 DCIM），此时没有任何 mkdir 事件，被动触发永远不删。
+     */
+    private static void deleteOnAllVolumes() {
+        java.util.Set<String> roots = new java.util.LinkedHashSet<>();
+        collectVolumesFromStorageManager(roots);
+        collectVolumesFromProcMounts(roots);
+        if (roots.isEmpty()) {
+            XposedBridge.log("[" + TAG + "] deleteOnAllVolumes: no external volume found");
+            return;
+        }
+        for (String root : roots) {
+            XposedBridge.log("[" + TAG + "] deleteOnAllVolumes -> " + root);
+            nativeDeleteOnVolume(root);
+        }
+    }
+
+    /** 通过 StorageManager 官方 API 获取所有外置卷根目录。 */
+    private static void collectVolumesFromStorageManager(java.util.Set<String> out) {
+        try {
+            Class<?> ctxClass = Class.forName("android.app.ActivityThread");
+            Object app = XposedHelpers.callStaticMethod(ctxClass, "currentApplication");
+            if (app == null) {
+                return;
+            }
+            Object sm = XposedHelpers.callMethod(app, "getSystemService", "storage");
+            if (sm == null) {
+                return;
+            }
+            java.util.List<?> volumes =
+                    (java.util.List<?>) XposedHelpers.callMethod(sm, "getStorageVolumes");
+            if (volumes == null) {
+                return;
+            }
+            for (Object vol : volumes) {
+                // 只处理「可移除 + 已挂载」的外置卷
+                Boolean removable = null;
+                try {
+                    removable = (Boolean) XposedHelpers.callMethod(vol, "isRemovable");
+                } catch (Throwable ignored) {
+                }
+                try {
+                    Object state = XposedHelpers.callMethod(vol, "getState");
+                    if (state != null && !"mounted".equals(state.toString())) {
+                        continue;
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (removable != null && !removable) {
+                    continue; // 内部卷跳过
+                }
+                Object dir = null;
+                try {
+                    dir = XposedHelpers.callMethod(vol, "getDirectory");
+                } catch (Throwable ignored) {
+                }
+                if (dir == null) {
+                    try {
+                        dir = XposedHelpers.callMethod(vol, "getPath");
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (dir != null) {
+                    String root = toVolumeRoot(dir.toString());
+                    if (root != null) {
+                        out.add(root);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] collectFromStorageManager failed: " + t);
+        }
+    }
+
+    /** 从 /proc/self/mounts 解析 /storage/&lt;uuid&gt; 形式的外置卷挂载点。 */
+    private static void collectVolumesFromProcMounts(java.util.Set<String> out) {
+        java.io.BufferedReader br = null;
+        try {
+            br = new java.io.BufferedReader(new java.io.FileReader("/proc/self/mounts"));
+            String line;
+            while ((line = br.readLine()) != null) {
+                String[] parts = line.split("\\s+");
+                if (parts.length < 3) {
+                    continue;
+                }
+                String root = toVolumeRoot(parts[1]);
+                if (root != null) {
+                    out.add(root);
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG + "] collectFromProcMounts failed: " + t);
+        } finally {
+            if (br != null) {
+                try {
+                    br.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private static final String TAG_LISTENER = "BlockDirsVolume";
+
+    /**
+     * 注册 StorageManager 卷状态监听：U 盘/SD 卡插入并挂载后立即触发删除。
+     * 这比盲 hook 各种不确定的方法名可靠得多（不同 ROM 方法名千差万别）。
+     */
+    private static void registerVolumeListener() {
+        try {
+            Class<?> ctxClass = Class.forName("android.app.ActivityThread");
+            Object app = XposedHelpers.callStaticMethod(ctxClass, "currentApplication");
+            if (app == null) {
+                XposedBridge.log("[" + TAG_LISTENER + "] no application context, skip listener");
+                return;
+            }
+            Object sm = XposedHelpers.callMethod(app, "getSystemService", "storage");
+            if (sm == null) {
+                return;
+            }
+            // 构造 StorageVolumeCallback
+            Class<?> cbClass = XposedHelpers.findClassIfExists(
+                    "android.os.storage.StorageManager$StorageVolumeCallback",
+                    sm.getClass().getClassLoader());
+            if (cbClass == null) {
+                XposedBridge.log("[" + TAG_LISTENER + "] StorageVolumeCallback not found, skip");
+                return;
+            }
+            Object callback = XposedHelpers.newInstance(cbClass);
+            XposedHelpers.findAndHookMethod(cbClass, "onVolumeStateChanged",
+                    new Object[]{android.os.storage.StorageVolume.class,
+                            new XC_MethodHook() {
+                                @Override
+                                protected void afterHookedMethod(MethodHookParam param) {
+                                    try {
+                                        Object vol = param.args[0];
+                                        if (vol == null) {
+                                            return;
+                                        }
+                                        Object dir = null;
+                                        try {
+                                            dir = XposedHelpers.callMethod(vol, "getDirectory");
+                                        } catch (Throwable ignored) {
+                                        }
+                                        if (dir == null) {
+                                            try {
+                                                dir = XposedHelpers.callMethod(vol, "getPath");
+                                            } catch (Throwable ignored) {
+                                            }
+                                        }
+                                        if (dir != null) {
+                                            String root = toVolumeRoot(dir.toString());
+                                            if (root != null) {
+                                                XposedBridge.log("[" + TAG_LISTENER
+                                                        + "] volume state changed -> " + root);
+                                                pushDeleteNames();  // 先刷新最新勾选
+                                                nativeDeleteOnVolume(root);
+                                            }
+                                        }
+                                    } catch (Throwable t) {
+                                        XposedBridge.log("[" + TAG_LISTENER + "] cb error: " + t);
+                                    }
+                                }
+                            }});
+            XposedHelpers.callMethod(sm, "registerListener", callback);
+            XposedBridge.log("[" + TAG_LISTENER + "] StorageManager volume listener registered");
+        } catch (Throwable t) {
+            XposedBridge.log("[" + TAG_LISTENER + "] registerVolumeListener failed: " + t);
+        }
     }
 
     /**

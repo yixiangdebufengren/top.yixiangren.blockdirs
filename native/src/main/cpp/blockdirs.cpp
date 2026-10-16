@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -200,55 +201,77 @@ static void on_volume_path_seen(const char *path) {
     do_delete_on_volume(volRoot);
 }
 
-// 扫描 /storage 下所有外置卷的根目录，对每个卷执行一次删除。
+// 从 /proc/self/mounts 中解析出所有外置卷挂载点。
+//
+// 为什么要用 /proc/self/mounts 而不是 opendir("/storage")：
+//   MediaProvider 的 uid(10192) 对 /storage 只有 group 的 x(可进入)权限，
+//   没有 r(读)权限（/storage 权限位是 0710，owner=root group=media_rw）。
+//   因此 opendir("/storage") 会 EACCES(errno=13)，无法枚举卷。
+//   但「已知卷根路径的访问」只需要 x 权限即可 —— 所以只要能拿到卷根路径，
+//   就能正常 lstat / 进入 / 删除。
+//   /proc/self/mounts 是内核提供的、任何进程都可读的挂载表，
+//   其中包含 /storage/<uuid> 这类挂载点，正好可以作为卷根来源。
+static void collect_volume_roots(std::vector<std::string> &out) {
+    FILE *fp = fopen("/proc/self/mounts", "r");
+    if (fp == nullptr) {
+        int e = errno;
+        LOGE("[DIAG] mounts fopen FAIL errno=%d(%s)", e, strerror(e));
+        return;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        // 字段: dev mountpoint fstype options dump pass
+        char dev[512], mp[1024], fstype[128];
+        if (sscanf(line, "%511s %1023s %127s", dev, mp, fstype) != 3) {
+            continue;
+        }
+        // 只关心外置卷挂载点：/storage/<uuid>
+        if (strncmp(mp, "/storage/", 9) != 0) {
+            continue;
+        }
+        const char *base = mp + 9;
+        // 排除内部共享存储及其它伪目录
+        if (strncmp(base, "emulated", 8) == 0) continue;
+        if (strncmp(base, "self", 4) == 0) continue;
+        if (strncmp(base, "persist", 7) == 0) continue;
+        if (base[0] == '\0') continue;
+        // 卷根只允许 /storage/<uuid>（后面不再有 '/'）
+        if (strchr(base, '/') != nullptr) continue;
+        out.push_back(std::string(mp));
+        LOGE("[DIAG] mounts found volume root=%s fstype=%s dev=%s", mp, fstype, dev);
+    }
+    fclose(fp);
+}
+
+// 扫描所有外置卷的根目录，对每个卷执行一次删除。
 // 不依赖 mkdir 是否被调用，因此即使勾选目录已存在也能删。
 static void scan_all_volumes() {
     LOGE("[DIAG] ===== scan_all_volumes BEGIN uid=%d =====", (int)getuid());
-    const char *roots[] = {"/storage", "/mnt/media_rw"};
-    for (int r = 0; r < 2; ++r) {
-        DIR *d = opendir(roots[r]);
-        if (d == nullptr) {
+    std::vector<std::string> roots;
+    collect_volume_roots(roots);
+    for (size_t i = 0; i < roots.size(); ++i) {
+        const std::string &volRoot = roots[i];
+        struct stat st;
+        int lr = lstat(volRoot.c_str(), &st);
+        if (lr != 0) {
             int e = errno;
-            LOGE("[DIAG] scan opendir FAIL root=%s errno=%d(%s)", roots[r], e, strerror(e));
+            LOGE("[DIAG] scan lstat FAIL %s ret=%d errno=%d(%s)", volRoot.c_str(), lr, e, strerror(e));
             continue;
         }
-        LOGE("[DIAG] scan opendir OK root=%s", roots[r]);
-        struct dirent *ent;
-        while ((ent = readdir(d)) != nullptr) {
-            const char *name = ent->d_name;
-            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-                continue;
-            }
-            LOGE("[DIAG] scan entry: root=%s name=%s", roots[r], name);
-            if (strcmp(name, "emulated") == 0 || strcmp(name, "self") == 0
-                    || strcmp(name, "persist") == 0) {
-                LOGE("[DIAG] scan skip (internal): %s", name);
-                continue;
-            }
-            std::string volRoot = std::string(roots[r]) + "/" + name;
-            struct stat st;
-            int lr = lstat(volRoot.c_str(), &st);
-            if (lr != 0) {
-                int e = errno;
-                LOGE("[DIAG] scan lstat FAIL %s ret=%d errno=%d(%s)", volRoot.c_str(), lr, e, strerror(e));
-                continue;
-            }
-            if (!S_ISDIR(st.st_mode)) {
-                LOGE("[DIAG] scan skip (not dir) %s mode=%o", volRoot.c_str(), (unsigned)st.st_mode);
-                continue;
-            }
-            // 同一个卷可能同时出现在 /storage 与 /mnt/media_rw（bind mount），
-            // 用时间窗去重，避免对同一物理卷重复遍历。
-            if (!should_process_volume(volRoot)) {
-                LOGE("[DIAG] scan SKIP by dedup-window: %s", volRoot.c_str());
-                continue;
-            }
-            LOGE("[DIAG] scan PROCESS volume: %s", volRoot.c_str());
-            do_delete_on_volume(volRoot);
+        if (!S_ISDIR(st.st_mode)) {
+            LOGE("[DIAG] scan skip (not dir) %s mode=%o", volRoot.c_str(), (unsigned)st.st_mode);
+            continue;
         }
-        closedir(d);
+        // 同一个卷可能同时出现在 /storage 与 /mnt/media_rw（bind mount），
+        // 用时间窗去重，避免对同一物理卷重复遍历。
+        if (!should_process_volume(volRoot)) {
+            LOGE("[DIAG] scan SKIP by dedup-window: %s", volRoot.c_str());
+            continue;
+        }
+        LOGE("[DIAG] scan PROCESS volume: %s", volRoot.c_str());
+        do_delete_on_volume(volRoot);
     }
-    LOGE("[DIAG] ===== scan_all_volumes END =====");
+    LOGE("[DIAG] ===== scan_all_volumes END (vols=%zu) =====", roots.size());
 }
 
 // ============ Hook 后的 mkdir / mkdirat ============
