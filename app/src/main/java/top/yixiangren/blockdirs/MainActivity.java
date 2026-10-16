@@ -129,7 +129,7 @@ public class MainActivity extends Activity {
 
     /**
      * 配置变更后：
-     *  1) 尽尝试用 root 写全局可读的镜像文件 /data/local/tmp/blockdirs.conf；
+     *  1) 用 root 把镜像文件写进 MediaProvider 私有目录；
      *  2) 杀掉 MediaProvider 进程，让它重启时重新读取新配置。
      * 两者都在后台线程执行，不阻塞 UI。
      */
@@ -139,8 +139,8 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 用 su 把配置写到 /data/local/tmp/blockdirs.conf（0644，全局可读），
-     * 然后杀掉 MediaProvider 进程，使其重启时重新读取新配置。
+     * 用 su 把配置写到 MediaProvider 私有目录（0600，属主=provider uid，
+     * 标签=privapp_data_file），然后杀掉 MediaProvider 进程，使其重启时重读配置。
      *
      * 为什么要杀：native 里的名单 g_delete_names 只在进程启动（handleLoadPackage
      * -> pushDeleteNames）时写入一次；不重启进程，改了配置也不会重新推送。
@@ -154,16 +154,23 @@ public class MainActivity extends Activity {
             try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp)) {
                 fos.write(content.getBytes("UTF-8"));
             }
-            // 目标：MediaProvider 自己的私有目录。/data/user_de/0/<pkg> 在有些 ROM
-            // 不存在或为符号链接，统一先 mkdir -p 再用 -L 跟随写入（不破坏软链）。
-            // 写入后 chown 给 provider 的 uid，使其读自己的文件时 SELinux 放行。
+            // 目标：MediaProvider 自己的私有目录。因为 /data/local/tmp 的 SELinux
+            // 标签是 shell_data_file，provider 的 mediaprovider_app 域读它会被拒；
+            // 写进 provider 自己家目录（privapp_data_file）则天然放行。
+            // 关键：写完必须改对「权限 + 属主 + SELinux 标签」，否则 provider 仍读不到。
             String dir = "/data/user_de/0/com.android.providers.media.module";
             String target = dir + "/blockdirs.conf";
-            String cmd = "mkdir -p " + dir
-                    + " && cp -f " + tmp.getAbsolutePath() + " " + target
-                    + " && chmod 600 " + target
-                    + " && chown 10192:10192 " + target
-                    + " && chcon u:object_r:privapp_data_file:s0 " + target;
+            // 动态查询 provider 目录的属主，避免硬编码 uid 在其他设备/重装后失效；
+            // 若目录不存在（stat 失败）则退回按包名解析 uid 的方式。
+            String cmd = "TARGET=" + target
+                    + "; if [ -d " + dir + " ]; then"
+                    + " UID=$(stat -c %u " + dir + "); GID=$(stat -c %g " + dir + ");"
+                    + " else UID=$(stat -c %u /data/data/com.android.providers.media.module);"
+                    + " GID=$(stat -c %g /data/data/com.android.providers.media.module); fi;"
+                    + " cp -f " + tmp.getAbsolutePath() + " $TARGET"
+                    + " && chmod 600 $TARGET"
+                    + " && chown $UID:$GID $TARGET"
+                    + " && chcon u:object_r:privapp_data_file:s0 $TARGET";
             p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
             int code = p.waitFor();
             android.util.Log.i("BlockDirs", "writeConfAsRoot exit=" + code);
