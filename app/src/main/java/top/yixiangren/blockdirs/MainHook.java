@@ -24,6 +24,8 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     private static final String TAG = "BlockDirs";
     private static final String SELF_PACKAGE = "top.yixiangren.blockdirs";
     private static final String MEDIA_PROVIDER = "com.android.providers.media.module";
+    private static final String MEDIA_PROVIDER_LEGACY = "com.android.providers.media";
+
     private static volatile boolean nativeLoaded = false;
 
     @Override
@@ -68,7 +70,7 @@ public class MainHook implements IXposedHookLoadPackage, IXposedHookZygoteInit {
     }
 
     private static boolean isMediaProvider(String packageName) {
-        return MEDIA_PROVIDER.equals(packageName);
+        return MEDIA_PROVIDER.equals(packageName) || MEDIA_PROVIDER_LEGACY.equals(packageName);
     }
 
     private static boolean ensureNativeLoaded() {

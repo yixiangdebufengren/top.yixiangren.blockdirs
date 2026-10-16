@@ -62,39 +62,33 @@ static bool is_top_level_on_external(const char *path) {
 }
 
 // Hook 后的 mkdir
-//
-// 注意：必须：
-//  1) 调用 SHADOWHOOK_STACK_SCOPE()（C++ RAII，函数退出时自动 pop_stack）。
-//     否则 shadowhook 的 hub 会认为上一次代理调用「还在递归中」，
-//     从第二次调用起就不再回调本代理函数，导致 hook 形同虚设。
-//  2) 调用原函数必须用 SHADOWHOOK_CALL_PREV 宏（官方要求），
-//     不能直接调裸函数指针。
 static int my_mkdir(const char *path, mode_t mode) {
-    SHADOWHOOK_STACK_SCOPE();
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdir (top-level on external volume): %s", path);
         return 0;
     }
-    return SHADOWHOOK_CALL_PREV(my_mkdir, path, mode);
+    return orig_mkdir(path, mode);
 }
+
 // Hook 后的 mkdirat
 static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
-    SHADOWHOOK_STACK_SCOPE();
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdirat (top-level on external volume): %s", path);
         return 0;
     }
-    return SHADOWHOOK_CALL_PREV(my_mkdirat, dirfd, path, mode);
+    return orig_mkdirat(dirfd, path, mode);
 }
+
 extern "C" JNIEXPORT void JNICALL
 Java_top_yixiangren_blockdirs_MainHook_installNativeHook(JNIEnv *env, jclass clazz) {
     LOGI("installNativeHook: block ALL top-level dirs on external volumes");
-    // 初始化 shadowhook。
-    // 用 SHARED 模式：多个 hook 目标 / 多次加载时更稳，且官方推荐。
-    if (shadowhook_init(SHADOWHOOK_MODE_SHARED, false) != 0) {
+
+    // 初始化 shadowhook（默认 inline 模式）
+    if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
         LOGE("shadowhook_init failed");
         return;
     }
+
     // Hook libc 的 mkdir
     void *mkdir_stub = shadowhook_hook_sym_name(
             "libc.so", "mkdir", (void *)my_mkdir, (void **)&orig_mkdir);
