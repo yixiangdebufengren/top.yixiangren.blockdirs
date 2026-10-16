@@ -53,27 +53,88 @@ static bool should_process_volume(const std::string &volRoot) {
     return true;
 }
 
+// 删除一个目录，失败于 ENOTEMPTY/EBUSY 时重试若干次（每次间隔递增）。
+//
+// 为什么必须重试（真机实测结论）：
+//   外置卷（exfat/vfat）经 FUSE 挂载。删除其上的目录时，VFS 的 dentry/attr
+//   缓存存在滞后：当刚刚递归删除了某个目录的所有子项后「立刻」rmdir 该目录，
+//   内核可能仍基于过期缓存返回 ENOTEMPTY（Directory not empty），
+//   尤其当目录正被其它 app（如微信）活跃访问时更明显。
+//   实测：删除 Android/data/<app>/cache 后立刻 rmdir <app> 会 ENOTEMPTY；
+//         间隔约 2 秒后重试即成功。因此这里加入短等待重试。
+static bool rmdir_with_retry(const std::string &path) {
+    const int kMaxTries = 8;
+    for (int i = 0; i < kMaxTries; ++i) {
+        if (rmdir(path.c_str()) == 0) {
+            return true;
+        }
+        int e = errno;
+        // 只对「目录非空 / 忙」这类可恢复错误重试；
+        // ENOENT 说明已被删除（成功）；其它错误（权限等）不再白费力气。
+        if (e == ENOENT) {
+            return true;
+        }
+        if (e != ENOTEMPTY && e != EBUSY && e != EEXIST) {
+            return false;
+        }
+        usleep(150 * 1000);  // 150ms，等 FUSE 缓存刷新
+    }
+    return rmdir(path.c_str()) == 0;
+}
+
 // 递归删除目录/文件（删除用 unlink/rmdir，不经过被 hook 的 mkdir）
 static bool remove_recursive(const std::string &path) {
     struct stat st;
     if (lstat(path.c_str(), &st) != 0) {
-        return false;
+        return errno == ENOENT;  // 已不存在视为成功
     }
     if (S_ISDIR(st.st_mode)) {
-        DIR *d = opendir(path.c_str());
-        if (d != nullptr) {
+        // 先递归删除所有子项。若子项删除不完全（活跃引用），
+        // 下面的 rmdir_with_retry 有可能在稍后成功清空。
+        for (int round = 0; round < 3; ++round) {
+            DIR *d = opendir(path.c_str());
+            if (d == nullptr) {
+                break;
+            }
+            bool had_child = false;
             struct dirent *ent;
             while ((ent = readdir(d)) != nullptr) {
                 if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
                     continue;
                 }
+                had_child = true;
                 remove_recursive(path + "/" + ent->d_name);
             }
             closedir(d);
+            // 子项已清空则跳出，交给 rmdir_with_retry 删本目录。
+            DIR *chk = opendir(path.c_str());
+            if (chk == nullptr) {
+                break;
+            }
+            bool still_has = false;
+            while ((ent = readdir(chk)) != nullptr) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+                    continue;
+                }
+                still_has = true;
+                break;
+            }
+            closedir(chk);
+            if (!still_has) {
+                break;
+            }
+            if (!had_child && still_has) {
+                // 有子项但删不掉（被占用/重建），再试也没用，避免死循环。
+                break;
+            }
+            usleep(150 * 1000);
         }
-        return rmdir(path.c_str()) == 0;
+        return rmdir_with_retry(path);
     } else {
-        return unlink(path.c_str()) == 0;
+        if (unlink(path.c_str()) == 0) {
+            return true;
+        }
+        return errno == ENOENT;
     }
 }
 
@@ -148,7 +209,21 @@ static void do_delete_on_volume(const std::string &volRoot) {
         if (lstat(target.c_str(), &st) != 0) {
             continue;  // 目录本就不存在，无需处理（正常情况，不打日志）
         }
-        if (remove_recursive(target)) {
+        // 目标若在首次删除后仍残留（典型的：子项刚删净但父目录因 FUSE
+        // 缓存滞后未能一次删掉），允许整体再尝试若干次。
+        bool ok = false;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (remove_recursive(target)) {
+                ok = true;
+                break;
+            }
+            if (lstat(target.c_str(), &st) != 0) {
+                ok = true;  // 已被删除
+                break;
+            }
+            sleep(1);  // 给 FUSE/占用方 1 秒，再整体重试
+        }
+        if (ok) {
             LOGI("DELETED %s", target.c_str());
         } else {
             LOGW("delete failed: %s (errno=%d %s)", target.c_str(), errno, strerror(errno));
