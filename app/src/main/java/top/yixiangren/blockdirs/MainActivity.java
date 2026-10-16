@@ -8,6 +8,7 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.view.LayoutInflater;
 import android.view.View;
 import android.view.Window;
 import android.widget.ImageView;
@@ -24,8 +25,13 @@ import com.google.android.material.snackbar.Snackbar;
  *
  * 浅绿主题 + Material 卡片布局 + 居中标题栏。
  * 顶部卡片点击跳转到博客说明页。
+ *
+ * 新增：设置区加入「自动删除已存在文件夹」主开关，开启后动态展开
+ * 各目录的子开关（由 {@link DirConfig#DIRS} 生成）。
  */
 public class MainActivity extends Activity {
+
+    private LinearLayout dirListContainer;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -40,6 +46,7 @@ public class MainActivity extends Activity {
         bindHideIconSwitch();
         bindActivationStatus();
         bindUpdateCheck();
+        bindAutoDeleteSwitch();
         checkUpdate();
     }
 
@@ -49,11 +56,8 @@ public class MainActivity extends Activity {
      */
     private void applyStatusBar() {
         Window window = getWindow();
-        // 取动态取色后的 surface 色作为状态栏背景（与页面背景一致）
-        // colorSurface 是 Material Components 定义的 attr，不是框架 android.R.attr
         int surface = resolveThemeColor(com.google.android.material.R.attr.colorSurface);
         window.setStatusBarColor(surface);
-        // 浅色背景 -> 深色前景图标，深色背景 -> 浅色前景图标
         boolean isLight = ColorUtils.calculateLuminance(surface) > 0.5;
         int flags = window.getDecorView().getSystemUiVisibility();
         if (isLight) {
@@ -73,10 +77,67 @@ public class MainActivity extends Activity {
     }
 
     /**
+     * 绑定「自动删除已存在文件夹」主开关。
+     * 开启后展开目录子开关列表；关闭则收起。
+     */
+    private void bindAutoDeleteSwitch() {
+        dirListContainer = findViewById(R.id.dir_list_container);
+        MaterialSwitch master = findViewById(R.id.switch_auto_delete);
+        if (master == null || dirListContainer == null) return;
+
+        boolean enabled = DirConfig.isAutoDeleteEnabled(this);
+        master.setChecked(enabled);
+        renderDirList(enabled);
+
+        master.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            DirConfig.setAutoDeleteEnabled(this, isChecked);
+            renderDirList(isChecked);
+            notifyConfigChanged();
+        });
+    }
+
+    /** 根据 DirConfig.DIRS 动态生成目录子开关列表。 */
+    private void renderDirList(boolean visible) {
+        if (dirListContainer == null) return;
+        dirListContainer.removeAllViews();
+        dirListContainer.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (!visible) return;
+
+        LayoutInflater inflater = LayoutInflater.from(this);
+        int marginTop = (int) (getResources().getDisplayMetrics().density * 10);
+        for (DirConfig.Dir d : DirConfig.DIRS) {
+            View row = inflater.inflate(R.layout.item_dir_switch, dirListContainer, false);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = marginTop;
+            row.setLayoutParams(lp);
+
+            TextView label = row.findViewById(R.id.dir_label);
+            label.setText(d.name);
+
+            MaterialSwitch sw = row.findViewById(R.id.dir_switch);
+            sw.setChecked(DirConfig.isDirEnabled(this, d.name));
+            sw.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                DirConfig.setDirEnabled(this, d.name, isChecked);
+                notifyConfigChanged();
+            });
+
+            dirListContainer.addView(row);
+        }
+    }
+
+    /**
+     * 配置变更后尝试通知 MediaProvider 进程立即刷新（进程若未运行则忽略，
+     * 下次被 LSPosed 注入时会重新读取）。
+     */
+    private void notifyConfigChanged() {
+        // MediaProvider 进程在下次卷活动时会重新读取 XSharedPreferences，
+        // 这里无需强制重启进程，保持简单可靠。
+    }
+
+    /**
      * 绑定「模块激活状态」卡片。
-     * 检测 LSPosed 框架是否已注入 zygote（传统模式免 root）：
-     * 若系统 classloader 能加载 XposedBridge，说明框架已激活，
-     * 模块 UI 既已能启动，即为已激活状态。
      */
     private void bindActivationStatus() {
         LinearLayout card = findViewById(R.id.card_status);
@@ -99,13 +160,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    /**
-     * 判断模块是否激活。
-     *
-     * 默认返回 false；模块在 handleLoadPackage 检测到自身包名被加载时，
-     * 会 hook {@link ModuleActive#isActive()} 使其返回 true。关闭模块后
-     * 该 hook 不再注入，自然回到 false，无任何持久化残留。
-     */
     private boolean isModuleActive() {
         return ModuleActive.isActive();
     }
