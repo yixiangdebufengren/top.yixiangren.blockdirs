@@ -8,7 +8,7 @@
 
 ## 背景
 
-Android 的 MediaProvider（`com.android.providers.media.module`，UID `10176`）在检测到外置存储卷首次挂载时，会在卷的根目录初始化一批标准媒体目录（`Android`、`Music`、`Pictures`、`DCIM`、`Movies` 等）。这些目录的创建并非走 Java 层的 `File.mkdir`，而是由 MediaProvider 通过 **native 层 FUSE** 直接调用 libc 的 `mkdir` / `mkdirat` 完成，因此常规的 Java 层 Hook 无法拦截。
+Android 的 MediaProvider（`com.android.providers.media.module`，实测 UID `10192` / `u0_a192`）在检测到外置存储卷首次挂载时，会在卷的根目录初始化一批标准媒体目录（`Android`、`Music`、`Pictures`、`DCIM`、`Movies` 等）。这些目录的创建并非走 Java 层的 `File.mkdir`，而是由 MediaProvider 通过 **native 层 FUSE** 直接调用 libc 的 `mkdir` / `mkdirat` 完成，因此常规的 Java 层 Hook 无法拦截。
 
 ## 原理
 
@@ -78,6 +78,46 @@ top.yixiangren.blockdirs/
 │   └── blockdirs.cpp
 └── ...
 ```
+
+---
+
+## 真机实测记录（ColorOS 16 / Android 16）
+
+以下为排障过程中得到的、对本模块设计有决定性影响的事实：
+
+### 1. MediaProvider 身份
+
+- 进程名 `com.android.providers.media.module`，**UID 10192（u0_a192）**；
+- 附加组包含 **`1023`（media_rw）**，因此对卷根（`media_rw:media_rw 0770`）有读写权限；
+- SELinux 域为 `u:r:mediaprovider_app:s0`。
+
+### 2. 外置卷的文件系统类型决定 hook 是否生效
+
+实测两个 U 盘：
+
+| 卷 | 挂载类型 | mkdir 是否经过 libc | hook 能否拦截 |
+|---|---|---|---|
+| `/storage/0EB8-0B1D` | **`vfat`**（内核直挂） | ❌ 由 VFS → vfat 内核模块完成，**不进 libc** | ❌ 拦不到 |
+| `/storage/0EB80A960EB80A96` | **`fuseblk`**（经 `/dev/fuse`） | ✅ 内核发给用户态 FUSE 守护（即 MediaProvider）→ 调 `libc.mkdir` | ✅ 可拦 |
+
+> **重要结论**：`vfat`（FAT32）卷由内核直接处理文件操作，**`mkdir` 不会经过 libc**，因此纯 hook 方案对 vfat 卷无效。
+> 这也是「自动删除」改为 **native 主动扫描**（`scan_all_volumes`，不依赖 mkdir 是否被调用）的原因——主动扫描对所有文件系统类型都有效。
+
+### 3. 跨进程配置传递的坑
+
+- MediaProvider **无法**读取模块 App 的私有 `SharedPreferences`（`/data/data/top.yixiangren.blockdirs` 权限 `0700`，`XSharedPreferences` 会被 `Permission denied`）；
+- 解决：App 用 `su` 将配置写到全局可读的 **`/data/local/tmp/blockdirs.conf`（0644）**，MediaProvider 直接读该文件；
+- 已验证 UID 10192 可成功读取该文件。
+
+### 4. 调试要点
+
+- native 的 `__android_log_print`（tag `BlockDirsNative`）在本 ROM 的 logcat 各缓冲区中**可能完全不可见**，
+  因此判断 native 是否运行**不能依赖日志**，应改为检查进程内存：
+  ```bash
+  grep -E 'shadowhook' /proc/$(pidof com.android.providers.media.module)/maps
+  # 出现 [anon:shadowhook-island] / [anon:shadowhook-enter] 即 hook 已建立
+  ```
+- 修改配置后需**重启 MediaProvider 进程**，native 才会重新读取配置并重新推送删除名单。
 
 ---
 
