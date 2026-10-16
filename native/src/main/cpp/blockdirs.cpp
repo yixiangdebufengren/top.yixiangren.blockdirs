@@ -200,33 +200,41 @@ static void scan_all_volumes() {
 }
 
 // ============ Hook 后的 mkdir / mkdirat ============
+//
+// 注意：必须调用 SHADOWHOOK_STACK_SCOPE()（C++ RAII，函数退出时自动调用
+// shadowhook_pop_stack）。否则 shadowhook 的 hub 会认为上一次代理调用“还在递归中”，
+// 从第二次调用开始就不再调用本代理函数，导致 hook 形同虚设。
+// 调用原函数必须用 SHADOWHOOK_CALL_PREV 宏（官方要求），不能直接调裸函数指针。
 static int my_mkdir(const char *path, mode_t mode) {
+    SHADOWHOOK_STACK_SCOPE();
+
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdir (top-level on external volume): %s", path);
-        // 有卷根层面的活动 = 卷刚被挂载/初始化，触发一次全卷扫描，
-        // 删除所有已存在的勾选目录（不局限于当前路径所在的卷）。
+        // 卷根活动 = 卷刚被挂载/初始化。顺手删除该卷已存在的勾选目录。
         on_volume_path_seen(path);
         scan_all_volumes();
-        return 0;
+        return 0;  // 假装成功，但不真正创建
     }
-    return orig_mkdir(path, mode);
+    return SHADOWHOOK_CALL_PREV(my_mkdir, path, mode);
 }
 
 static int my_mkdirat(int dirfd, const char *path, mode_t mode) {
+    SHADOWHOOK_STACK_SCOPE();
+
     if (is_top_level_on_external(path)) {
         LOGW("BLOCKED mkdirat (top-level on external volume): %s", path);
         on_volume_path_seen(path);
         scan_all_volumes();
         return 0;
     }
-    return orig_mkdirat(dirfd, path, mode);
+    return SHADOWHOOK_CALL_PREV(my_mkdirat, dirfd, path, mode);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_top_yixiangren_blockdirs_MainHook_installNativeHook(JNIEnv *env, jclass clazz) {
     LOGI("installNativeHook: block ALL top-level dirs on external volumes");
 
-    if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
+    if (shadowhook_init(SHADOWHOOK_MODE_SHARED, false) != 0) {
         LOGE("shadowhook_init failed");
         return;
     }
