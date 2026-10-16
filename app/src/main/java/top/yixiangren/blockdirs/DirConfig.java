@@ -27,8 +27,24 @@ public final class DirConfig {
 
     public static final String PREFS_NAME = "blockdirs_config";
 
-    /** 跨进程配置镜像文件（全局可读） */
-    public static final String CONFIG_FILE = "/data/local/tmp/blockdirs.conf";
+    /**
+     * 跨进程配置镜像文件路径。
+     *
+     * 关键：写入 MediaProvider 自己的私有目录（而非 /data/local/tmp）。
+     * 原因：/data/local/tmp 的 SELinux 标签是 shell_data_file，MediaProvider 的
+     * mediaprovider_app 域读它会被 avc 拒绝；而 provider 自己家目录的标签是
+     * privapp_data_file，它读自己的文件天然放行，不受任何策略阻拦。
+     * 写入需 root（由模块 App 通过 su 完成，写后 chown 给 provider 的 uid）。
+     */
+    public static final String CONFIG_FILE =
+            "/data/user_de/0/com.android.providers.media.module/blockdirs.conf";
+
+    /** 兼容的多用户/旧路径候选，读取时依次尝试。 */
+    public static final String[] CONFIG_FILE_CANDIDATES = new String[]{
+            "/data/user_de/0/com.android.providers.media.module/blockdirs.conf",
+            "/data/data/com.android.providers.media.module/blockdirs.conf",
+            "/data/user/0/com.android.providers.media.module/blockdirs.conf",
+    };
 
     public static final String KEY_AUTO_DELETE = "auto_delete_enabled";
 
@@ -134,9 +150,19 @@ public final class DirConfig {
 
     /** 读取镜像文件内容（MediaProvider 进程使用；找不到返回 null）。 */
     public static String readMirrorFile() {
+        for (String path : CONFIG_FILE_CANDIDATES) {
+            String content = readFileQuietly(path);
+            if (content != null) {
+                return content;
+            }
+        }
+        return null;
+    }
+
+    private static String readFileQuietly(String path) {
         FileInputStream fis = null;
         try {
-            fis = new FileInputStream(CONFIG_FILE);
+            fis = new FileInputStream(path);
             BufferedReader br = new BufferedReader(
                     new InputStreamReader(fis, StandardCharsets.UTF_8));
             StringBuilder sb = new StringBuilder();

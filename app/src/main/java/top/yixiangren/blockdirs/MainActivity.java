@@ -154,9 +154,16 @@ public class MainActivity extends Activity {
             try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmp)) {
                 fos.write(content.getBytes("UTF-8"));
             }
-            String cmd = "cp " + tmp.getAbsolutePath() + " " + DirConfig.CONFIG_FILE
-                    + " && chmod 644 " + DirConfig.CONFIG_FILE
-                    + " && chown root:root " + DirConfig.CONFIG_FILE;
+            // 目标：MediaProvider 自己的私有目录。/data/user_de/0/<pkg> 在有些 ROM
+            // 不存在或为符号链接，统一先 mkdir -p 再用 -L 跟随写入（不破坏软链）。
+            // 写入后 chown 给 provider 的 uid，使其读自己的文件时 SELinux 放行。
+            String dir = "/data/user_de/0/com.android.providers.media.module";
+            String target = dir + "/blockdirs.conf";
+            String cmd = "mkdir -p " + dir
+                    + " && cp -f " + tmp.getAbsolutePath() + " " + target
+                    + " && chmod 600 " + target
+                    + " && chown 10192:10192 " + target
+                    + " && chcon u:object_r:privapp_data_file:s0 " + target;
             p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
             int code = p.waitFor();
             android.util.Log.i("BlockDirs", "writeConfAsRoot exit=" + code);
